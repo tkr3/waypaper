@@ -45,6 +45,7 @@ fn main() {
             }
         }
     });
+
     thread::spawn({
         let state = Arc::clone(&state);
         move || loop {
@@ -58,6 +59,7 @@ fn main() {
             }
         }
     });
+
     thread::spawn({
         let mut dispatcher = Dispatcher {
             state: Arc::clone(&state),
@@ -226,7 +228,7 @@ impl State {
                     output.name
                 );
 
-                write_default_color(output, &mut buf);
+                write_default_color(output, &mut buf)?;
                 info!("{}: Done writing to buffer", output.name);
             }
 
@@ -267,7 +269,6 @@ impl State {
                 info!("Output changed, redrawing");
             }
         }
-
         Ok(())
     }
 }
@@ -287,10 +288,14 @@ fn write_image(
     Ok(())
 }
 
-fn write_default_color(output: &Output, buf: &mut std::io::BufWriter<&File>) {
+fn write_default_color(
+    output: &Output,
+    buf: &mut std::io::BufWriter<&File>,
+) -> std::io::Result<()> {
     for _ in 0..output.pixel_count {
-        buf.write_all(&[0, 0, 0]).unwrap();
+        buf.write(&[0, 0, 0])?;
     }
+    Ok(())
 }
 
 fn apply_image_mode(
@@ -362,7 +367,7 @@ impl OutputBuilder {
 
 impl Dispatch<wl_registry::WlRegistry, ()> for Dispatcher {
     fn event(
-        state: &mut Self,
+        dispatcher: &mut Self,
         registry: &wl_registry::WlRegistry,
         event: wl_registry::Event,
         _: &(),
@@ -376,17 +381,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Dispatcher {
             ..
         } = event
         {
+            let state = &mut dispatcher.state.lock().unwrap();
             match &interface[..] {
                 "wl_compositor" => {
-                    state.state.lock().unwrap().globals.compositor.replace(
+                    state.globals.compositor.replace(
                         registry.bind::<wl_compositor::WlCompositor, _, _>(name, version, qh, ()),
                     );
                 }
                 "wl_shm" => {
                     state
-                        .state
-                        .lock()
-                        .unwrap()
                         .globals
                         .shm
                         .replace(registry.bind::<wl_shm::WlShm, _, _>(name, version, qh, ()));
@@ -396,14 +399,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Dispatcher {
                         name,
                         version,
                         qh,
-                        state.state.lock().unwrap().next_output_id(),
+                        state.next_output_id(),
                     );
                 }
                 "zwlr_layer_shell_v1" => {
                     state
-                        .state
-                        .lock()
-                        .unwrap()
                         .globals
                         .layer_shell
                         .replace(registry.bind::<ZwlrLayerShellV1, _, _>(name, version, qh, ()));
@@ -416,7 +416,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Dispatcher {
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for Dispatcher {
     fn event(
-        state: &mut Self,
+        dispatcher: &mut Self,
         layer_surface: &ZwlrLayerSurfaceV1,
         event: <ZwlrLayerSurfaceV1 as wayland_client::Proxy>::Event,
         _: &(),
@@ -429,7 +429,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for Dispatcher {
                 width: _,
                 height: _,
             } => {
-                let state = &mut state.state.lock().unwrap();
+                let state = &mut dispatcher.state.lock().unwrap();
                 layer_surface.ack_configure(serial);
                 state.surface_configured += 1;
 
@@ -444,21 +444,23 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for Dispatcher {
 
 impl Dispatch<wl_output::WlOutput, usize> for Dispatcher {
     fn event(
-        state: &mut Self,
+        dispatcher: &mut Self,
         wl_output: &wl_output::WlOutput,
         event: wl_output::Event,
         output_id: &usize,
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        let mut builder = state
-            .state
-            .lock()
-            .unwrap()
-            .output_builders
-            .get(*output_id)
-            .unwrap_or(&OutputBuilder::default())
-            .clone();
+        let state = &mut dispatcher.state.lock().unwrap();
+
+        let builder = match state.output_builders.get_mut(*output_id) {
+            Some(builder) => builder,
+            None => {
+                state.output_builders.push(OutputBuilder::default());
+                state.output_builders.last_mut().unwrap()
+            }
+        };
+
         match event {
             wl_output::Event::Mode {
                 flags,
@@ -472,31 +474,17 @@ impl Dispatch<wl_output::WlOutput, usize> for Dispatcher {
                 // save output mode
                 builder.width = width as usize;
                 builder.height = height as usize;
-                state
-                    .state
-                    .lock()
-                    .unwrap()
-                    .output_builders
-                    .insert(*output_id, builder)
             }
             wl_output::Event::Name { name } => {
                 // save output name
                 builder.name = name;
-                state
-                    .state
-                    .lock()
-                    .unwrap()
-                    .output_builders
-                    .insert(*output_id, builder);
             }
             wl_output::Event::Done => {
-                let mut state = state.state.lock().unwrap();
-
                 builder.wl_output = Some(wl_output.clone());
-                state.outputs.push(builder.build());
-                state.output_builders.remove(*output_id);
 
-                let output = state.outputs.last().unwrap().clone();
+                let builder = state.output_builders.remove(*output_id);
+                let output = builder.build();
+
                 state.total_pixels += output.pixel_count;
 
                 let surface = state
@@ -524,7 +512,8 @@ impl Dispatch<wl_output::WlOutput, usize> for Dispatcher {
                 layer_surface.set_exclusive_zone(-1);
 
                 surface.commit();
-                state.surfaces.insert(output.name.to_string(), surface);
+                state.surfaces.insert(output.name.clone(), surface);
+                state.outputs.push(output);
 
                 state.setup_buffer_file(qh);
             }
@@ -535,20 +524,17 @@ impl Dispatch<wl_output::WlOutput, usize> for Dispatcher {
 
 impl Dispatch<wl_shm::WlShm, ()> for Dispatcher {
     fn event(
-        state: &mut Self,
+        dispatcher: &mut Self,
         _: &wl_shm::WlShm,
         event: wl_shm::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        match event {
-            wl_shm::Event::Format { format } => {
-                if let WEnum::Value(format) = format {
-                    state.state.lock().unwrap().shm_formats.push(format);
-                }
+        if let wl_shm::Event::Format { format } = event {
+            if let WEnum::Value(format) = format {
+                dispatcher.state.lock().unwrap().shm_formats.push(format);
             }
-            _ => {}
         }
     }
 }
